@@ -1043,9 +1043,11 @@ class PharmolixFM(PocketMolDockModel, StructureBasedDrugDesignModel):
             'pos': noisy_pos,
             'node_type': noisy_node,
             'halfedge_type': noisy_edge,
+            'halfedge_index': label.get('halfedge_index', torch.zeros(2, 0, dtype=torch.long, device=device)),
             't_pos': t,
-            't_node': t,
-            't_halfedge': t,
+            't_node_type': t,
+            't_halfedge_type': t,
+            'fixed_halfdist': torch.zeros(noisy_edge.shape[0], device=device),
         }
         
         # 模型前向

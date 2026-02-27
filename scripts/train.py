@@ -46,26 +46,35 @@ def train_epoch(model, dataloader, optimizer, device, epoch):
     num_batches = 0
     
     for batch_idx, (molecules, pockets, metadata) in enumerate(dataloader):
+        # 目前只支持 batch_size=1，取第一个样本
+        # TODO: 实现真正的 batch 处理
+        
         # 将数据移到设备
         for key in molecules:
-            molecules[key] = molecules[key].to(device)
+            if isinstance(molecules[key], torch.Tensor):
+                molecules[key] = molecules[key].to(device)
         for key in pockets:
-            pockets[key] = pockets[key].to(device)
+            if isinstance(pockets[key], torch.Tensor):
+                pockets[key] = pockets[key].to(device)
         
         optimizer.zero_grad()
         
-        # 前向传播和损失计算
-        loss_dict = model.forward_pocket_molecule_docking(pockets, molecules)
-        loss = loss_dict['loss']
-        
-        loss.backward()
-        optimizer.step()
-        
-        total_loss += loss.item()
-        num_batches += 1
-        
-        if batch_idx % 10 == 0:
-            print(f"Epoch {epoch}, Batch {batch_idx}, Loss: {loss.item():.4f}")
+        try:
+            # 前向传播和损失计算
+            loss_dict = model.forward_pocket_molecule_docking(pockets, molecules)
+            loss = loss_dict['loss']
+            
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            num_batches += 1
+            
+            if batch_idx % 10 == 0:
+                print(f"Epoch {epoch}, Batch {batch_idx}, Loss: {loss.item():.4f}")
+        except Exception as e:
+            print(f"Error in batch {batch_idx}: {e}")
+            continue
     
     return total_loss / max(num_batches, 1)
 
