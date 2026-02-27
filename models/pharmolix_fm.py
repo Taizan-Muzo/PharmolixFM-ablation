@@ -1131,60 +1131,68 @@ class PharmolixFM(PocketMolDockModel, StructureBasedDrugDesignModel):
         # Batch 前向传播
         outputs = self.model_forward(molecule_in, pockets_batch)
         
-        # 计算每个样本的损失
-        total_loss = 0.0
-        total_pos_loss = 0.0
-        total_node_loss = 0.0
-        total_edge_loss = 0.0
-        valid_samples = 0
+        # ========== 完全并行损失计算 ==========
+        # 计算每个节点的损失（并行）
         
-        for i in range(batch_size):
-            # 提取第 i 个样本
-            mol_mask = mol_batch == i
-            
-            sample_outputs = {
-                'pos': outputs['pos'][mol_mask],
-                'node_type': outputs.get('node_type', outputs.get('node_feature', torch.zeros(0, self.num_node_types, device=device)))[mol_mask],
-            }
-            
-            # 边需要特殊处理
-            if molecules_batch['halfedge_index'].shape[1] > 0:
-                edge_mask = mol_batch[molecules_batch['halfedge_index'][0]] == i
-                sample_outputs['halfedge_type'] = outputs.get('halfedge_type', outputs.get('edge_feature', torch.zeros(0, self.num_edge_types, device=device)))[edge_mask]
-            else:
-                sample_outputs['halfedge_type'] = torch.zeros(0, self.num_edge_types, device=device)
-            
-            sample_targets = {
-                'pos': molecules_batch['pos'][mol_mask],
-                'node_type': node_classes[mol_mask],
-                'halfedge_type': edge_classes[edge_mask] if molecules_batch['halfedge_index'].shape[1] > 0 else torch.zeros(0, dtype=torch.long, device=device),
-            }
-            
-            sample_t = t_per_sample[i:i+1].expand(mol_mask.sum())
-            
-            # 跳过空样本
-            if sample_targets['pos'].shape[0] == 0:
-                continue
-            
-            # 计算损失
-            loss_dict = bfn_loss.compute_loss(sample_outputs, sample_targets, sample_t)
-            
-            if not (torch.isnan(loss_dict['loss']) or torch.isinf(loss_dict['loss'])):
-                total_loss += loss_dict['loss']
-                total_pos_loss += loss_dict.get('pos_loss', 0)
-                total_node_loss += loss_dict.get('node_loss', 0)
-                total_edge_loss += loss_dict.get('edge_loss', 0)
-                valid_samples += 1
+        # 1. 位置损失（连续变量）- 每个节点
+        y_sender_pos, rho_sender_pos = bfn_loss.compute_sender_continuous(
+            molecules_batch['pos'], t_per_node, bfn_loss.sigma_data_pos)
+        pos_diff = outputs['pos'] - y_sender_pos
+        pos_loss_per_node = rho_sender_pos.view(-1, 1) * (pos_diff ** 2).sum(dim=-1)  # (N,)
         
-        if valid_samples == 0:
+        # 2. 节点类型损失（离散变量）- 每个节点
+        theta_sender_node = bfn_loss.compute_sender_discrete(
+            node_classes, t_per_node, self.config.num_node_types)
+        theta_receiver_node = F.softmax(
+            outputs.get('node_type', outputs.get('node_feature', torch.zeros(0, self.num_node_types, device=device))), 
+            dim=-1)
+        eps = 1e-10
+        node_loss_per_node = (theta_sender_node * (
+            torch.log(theta_sender_node + eps) - torch.log(theta_receiver_node + eps)
+        )).sum(dim=-1)  # (N,)
+        
+        # 3. 边类型损失（离散变量）- 每条边
+        if molecules_batch['halfedge_index'].shape[1] > 0:
+            theta_sender_edge = bfn_loss.compute_sender_discrete(
+                edge_classes, t_per_edge, self.config.num_edge_types)
+            theta_receiver_edge = F.softmax(
+                outputs.get('halfedge_type', outputs.get('edge_feature', torch.zeros(0, self.num_edge_types, device=device))),
+                dim=-1)
+            edge_loss_per_edge = (theta_sender_edge * (
+                torch.log(theta_sender_edge + eps) - torch.log(theta_receiver_edge + eps)
+            )).sum(dim=-1)  # (E,)
+            
+            # 使用 scatter_mean 计算每个样本的边损失
+            # 需要知道每条边属于哪个样本
+            edge_batch = mol_batch[molecules_batch['halfedge_index'][0]]  # (E,)
+            edge_loss_per_sample = scatter_mean(edge_loss_per_edge, edge_batch, dim=0, dim_size=batch_size)
+        else:
+            edge_loss_per_sample = torch.zeros(batch_size, device=device)
+        
+        # 使用 scatter_mean 计算每个样本的平均损失
+        pos_loss_per_sample = scatter_mean(pos_loss_per_node, mol_batch, dim=0, dim_size=batch_size)
+        node_loss_per_sample = scatter_mean(node_loss_per_node, mol_batch, dim=0, dim_size=batch_size)
+        
+        # 总损失（每个样本）
+        loss_per_sample = pos_loss_per_sample + node_loss_per_sample + edge_loss_per_sample
+        
+        # 检查 NaN/Inf
+        valid_mask = ~(torch.isnan(loss_per_sample) | torch.isinf(loss_per_sample))
+        
+        if valid_mask.sum() == 0:
             return {'loss': torch.tensor(0.0, device=device, requires_grad=True)}
         
-        # 返回平均损失
+        # 平均损失（只考虑有效样本）
+        total_loss = loss_per_sample[valid_mask].mean()
+        total_pos_loss = pos_loss_per_sample[valid_mask].mean()
+        total_node_loss = node_loss_per_sample[valid_mask].mean()
+        total_edge_loss = edge_loss_per_sample[valid_mask].mean()
+        
         return {
-            'loss': total_loss / valid_samples,
-            'pos_loss': total_pos_loss / valid_samples,
-            'node_loss': total_node_loss / valid_samples,
-            'edge_loss': total_edge_loss / valid_samples,
+            'loss': total_loss,
+            'pos_loss': total_pos_loss,
+            'node_loss': total_node_loss,
+            'edge_loss': total_edge_loss,
         }
 
     def forward_structure_based_drug_design(self, pocket: List[Pocket], label: List[Molecule]) -> Dict[str, torch.Tensor]:
