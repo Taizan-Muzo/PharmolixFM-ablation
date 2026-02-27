@@ -1064,6 +1064,129 @@ class PharmolixFM(PocketMolDockModel, StructureBasedDrugDesignModel):
         
         return loss_dict
 
+    def forward_pocket_molecule_docking_batch(self, pockets_batch, molecules_batch):
+        """
+        Batch 版本的口袋-分子对接训练前向传播
+        使用 PyTorch Geometric Batch 实现真正的并行
+        
+        Args:
+            pockets_batch: Batch of pockets (from collate_fn)
+            molecules_batch: Batch of molecules (from collate_fn)
+        
+        Returns:
+            平均损失字典
+        """
+        from models.bfn_loss import BFNLoss, add_noise_to_continuous, add_noise_to_discrete
+        from torch_geometric.data import Batch
+        
+        device = molecules_batch['pos'].device
+        bfn_loss = BFNLoss(self.config)
+        
+        # 获取 batch 信息
+        batch_size = molecules_batch['batch'].max().item() + 1
+        mol_batch = molecules_batch['batch']
+        pocket_batch = pockets_batch['batch']
+        
+        # 为每个样本采样时间步
+        t_per_sample = torch.rand(batch_size, device=device)
+        t_per_node = t_per_sample[mol_batch]
+        
+        # 添加噪声到整个 batch
+        noisy_pos = add_noise_to_continuous(
+            molecules_batch['pos'], t_per_node, self.config.sigma_data_pos)
+        
+        # 处理节点类型
+        if molecules_batch['node_type'].dim() > 1:
+            node_classes = molecules_batch['node_type'].argmax(dim=-1)
+        else:
+            node_classes = molecules_batch['node_type']
+        
+        noisy_node = add_noise_to_discrete(
+            node_classes, t_per_node, self.config.num_node_types)
+        
+        # 处理边类型
+        if molecules_batch['halfedge_type'].dim() > 1:
+            edge_classes = molecules_batch['halfedge_type'].argmax(dim=-1)
+        else:
+            edge_classes = molecules_batch['halfedge_type']
+        
+        # 为边创建时间步（需要重新索引）
+        # 简化：使用节点时间步的平均或第一个节点的时间步
+        t_per_edge = t_per_node[molecules_batch['halfedge_index'][0]] if molecules_batch['halfedge_index'].shape[1] > 0 else t_per_node[:0]
+        noisy_edge = add_noise_to_discrete(
+            edge_classes, t_per_edge, self.config.num_edge_types)
+        
+        # 构建 batch 输入
+        molecule_in = {
+            'pos': noisy_pos,
+            'node_type': noisy_node,
+            'halfedge_type': noisy_edge,
+            'halfedge_index': molecules_batch['halfedge_index'],
+            't_pos': t_per_node,
+            't_node_type': t_per_node,
+            't_halfedge_type': t_per_edge,
+            'fixed_halfdist': torch.zeros(noisy_edge.shape[0], device=device),
+        }
+        
+        # Batch 前向传播
+        outputs = self.model_forward(molecule_in, pockets_batch)
+        
+        # 计算每个样本的损失
+        total_loss = 0.0
+        total_pos_loss = 0.0
+        total_node_loss = 0.0
+        total_edge_loss = 0.0
+        valid_samples = 0
+        
+        for i in range(batch_size):
+            # 提取第 i 个样本
+            mol_mask = mol_batch == i
+            
+            sample_outputs = {
+                'pos': outputs['pos'][mol_mask],
+                'node_type': outputs.get('node_type', outputs.get('node_feature', torch.zeros(0, self.num_node_types, device=device)))[mol_mask],
+            }
+            
+            # 边需要特殊处理
+            if molecules_batch['halfedge_index'].shape[1] > 0:
+                edge_mask = mol_batch[molecules_batch['halfedge_index'][0]] == i
+                sample_outputs['halfedge_type'] = outputs.get('halfedge_type', outputs.get('edge_feature', torch.zeros(0, self.num_edge_types, device=device)))[edge_mask]
+            else:
+                sample_outputs['halfedge_type'] = torch.zeros(0, self.num_edge_types, device=device)
+            
+            sample_targets = {
+                'pos': molecules_batch['pos'][mol_mask],
+                'node_type': node_classes[mol_mask],
+                'halfedge_type': edge_classes[edge_mask] if molecules_batch['halfedge_index'].shape[1] > 0 else torch.zeros(0, dtype=torch.long, device=device),
+            }
+            
+            sample_t = t_per_sample[i:i+1].expand(mol_mask.sum())
+            
+            # 跳过空样本
+            if sample_targets['pos'].shape[0] == 0:
+                continue
+            
+            # 计算损失
+            loss_dict = bfn_loss.compute_loss(sample_outputs, sample_targets, sample_t)
+            
+            if not (torch.isnan(loss_dict['loss']) or torch.isinf(loss_dict['loss'])):
+                total_loss += loss_dict['loss']
+                total_pos_loss += loss_dict.get('pos_loss', 0)
+                total_node_loss += loss_dict.get('node_loss', 0)
+                total_edge_loss += loss_dict.get('edge_loss', 0)
+                valid_samples += 1
+        
+        if valid_samples == 0:
+            return {'loss': torch.tensor(0.0, device=device, requires_grad=True)}
+        
+        # 返回平均损失
+        return {
+            'loss': total_loss / valid_samples,
+            'pos_loss': total_pos_loss / valid_samples,
+            'node_loss': total_node_loss / valid_samples,
+            'edge_loss': total_edge_loss / valid_samples,
+        }
+
     def forward_structure_based_drug_design(self, pocket: List[Pocket], label: List[Molecule]) -> Dict[str, torch.Tensor]:
         """
         基于结构的药物设计训练前向传播
