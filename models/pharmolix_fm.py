@@ -23,7 +23,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from data.molecule import Molecule, Pocket, estimate_ligand_atom_num
 from utils.misc import safe_index, PygCollator
+from utils.config import Config
 from utils.featurizer import MoleculeFeaturizer, PocketFeaturizer
+from utils.pocket_featurizer import PharmolixFMPocketFeaturizer
 
 # 任务模型基类（简化版）
 class PocketMolDockModel:
@@ -32,7 +34,12 @@ class PocketMolDockModel:
 class StructureBasedDrugDesignModel:
     pass
 
-class Featurized:
+# Featurized 泛型支持
+from typing import TypeVar, Generic
+T = TypeVar('T')
+
+class Featurized(Generic[T]):
+    """特征化数据包装类"""
     pass
 
 @contextmanager
