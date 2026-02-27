@@ -42,30 +42,77 @@ pip install -r requirements.txt
 
 ## 快速开始
 
-### 训练
+### 1. 下载测试数据
 ```bash
-python scripts/train.py --config configs/pharmolix_fm.yaml
+python scripts/download_data.py --dataset test
 ```
 
-### 推理（对接）
+### 2. 训练（使用虚拟数据测试）
 ```bash
-python scripts/inference.py --checkpoint model.ckpt --pdb protein.pdb --sdf ligand.sdf --task docking
+python scripts/train.py --use_dummy --epochs 5
 ```
 
-### 推理（分子生成）
+### 3. 训练（使用真实数据）
 ```bash
-python scripts/inference.py --checkpoint model.ckpt --pdb protein.pdb --sdf ref_ligand.sdf --task generation
+# 先下载 PDBbind 或 CrossDocked 数据集
+python scripts/download_data.py --dataset pdbbind
+
+# 然后训练
+python scripts/train.py --data_dir data/pdbbind/
+```
+
+### 4. 推理
+```bash
+python scripts/inference.py \
+    --checkpoint checkpoints/final_model.pt \
+    --pdb data/test_examples/4XLI.pdb \
+    --sdf data/test_examples/ligand.sdf \
+    --task docking
+```
+
+### 5. 评估
+```bash
+python scripts/evaluate.py \
+    --checkpoint checkpoints/final_model.pt \
+    --test_data data/test/ \
+    --output eval_results.json
 ```
 
 ## 目录结构
 ```
 PharmolixFM-ablation/
 ├── models/           # 模型定义（精简版）
+│   └── pharmolix_fm.py
 ├── data/             # 数据加载器
-├── configs/          # 配置文件
+│   ├── molecule.py
+│   └── dataset.py
+├── utils/            # 工具函数
+│   ├── config.py
+│   ├── featurizer.py
+│   └── pocket_featurizer.py
 ├── scripts/          # 训练和评估脚本
-└── utils/            # 工具函数
+│   ├── train.py
+│   ├── inference.py
+│   ├── evaluate.py
+│   └── download_data.py
+└── configs/          # 配置文件
+    └── pharmolix_fm.yaml
 ```
+
+## 已知限制
+
+1. **训练循环不完整**：BFN 损失函数未完全实现
+2. **数据加载简化**：口袋原子解析需要进一步完善
+3. **评估指标缺失**：RMSD、亲和力等指标待实现
+4. **无预训练权重**：需要从头训练或使用 OpenBioMed 的权重
+
+## 开发计划
+
+- [ ] 实现完整的 BFN 训练损失
+- [ ] 添加口袋原子解析（从 PDB）
+- [ ] 实现评估指标（RMSD、亲和力）
+- [ ] 支持加载 OpenBioMed 预训练权重
+- [ ] 添加更多数据集支持
 
 ## 许可证
 MIT
