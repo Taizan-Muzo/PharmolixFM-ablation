@@ -54,9 +54,9 @@ def train_epoch(model, dataloader, optimizer, device, epoch):
         
         optimizer.zero_grad()
         
-        # TODO: 实现前向传播和损失计算
-        # 目前使用虚拟损失
-        loss = torch.tensor(0.0, requires_grad=True, device=device)
+        # 前向传播和损失计算
+        loss_dict = model.forward_pocket_molecule_docking(pockets, molecules)
+        loss = loss_dict['loss']
         
         loss.backward()
         optimizer.step()
