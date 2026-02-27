@@ -1,20 +1,3 @@
-# PharmolixFM 代码审计报告（更新版）
-
-## 修复状态
-
-| 问题 | 状态 | 说明 |
-|------|------|------|
-| 1. 缺少依赖包 | ⚠️ 用户解决 | 运行 `pip install -r requirements.txt` |
-| 2. load_from_checkpoint 不存在 | ✅ 已修复 | 改用 `torch.load()` |
-| 3. 缺少 Config 类 | ✅ 已修复 | 添加 `utils/config.py` |
-| 4. Featurized 泛型问题 | ✅ 已修复 | 使用 `Generic[T]` |
-| 5. 训练脚本为空 | ✅ 已修复 | 添加完整训练循环 |
-| 6. 评估脚本为空 | ✅ 已修复 | 添加评估框架 |
-| 7. 数据下载脚本为空 | ✅ 已修复 | 添加下载逻辑 |
-| 8. 缺少 PocketFeaturizer | ✅ 已修复 | 添加 `utils/pocket_featurizer.py` |
-
-## 当前状态
-
 ### 可运行的脚本
 
 | 脚本 | 状态 | 说明 |
