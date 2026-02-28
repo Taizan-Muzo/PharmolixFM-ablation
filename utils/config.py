@@ -41,19 +41,31 @@ class Config:
         self.addition_node_features = []
         self.add_output = []
         
+        # 距离扩展配置
+        self.dist_cfg = {
+            'start': 0.0,
+            'stop': 10.0,
+            'num_gaussians': 16,
+        }
+        
         # 编码器配置（简化为字典）
         self.pocket = {
-            'num_layers': 3,
-            'num_heads': 4,
+            'node_dim': 128,
+            'edge_dim': 32,
             'hidden_dim': 128,
-            'gate_dim': 64,
+            'num_blocks': 3,
+            'dist_cfg': self.dist_cfg,
+            'gate_dim': 2,
         }
         
         self.denoiser = {
-            'num_layers': 6,
-            'num_heads': 8,
+            'node_dim': 128,
+            'edge_dim': 64,
             'hidden_dim': 256,
-            'gate_dim': 128,
+            'num_blocks': 6,
+            'dist_cfg': self.dist_cfg,
+            'gate_dim': 2,
+            'knn': 32,
         }
         
         # 训练配置

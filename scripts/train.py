@@ -27,8 +27,8 @@ def collate_fn(batch):
     cumsum_nodes = 0
     cumsum_pocket_nodes = 0
     
-    batch_mol = {key: [] for key in ['node_type', 'pos', 'halfedge_type', 'halfedge_index']}
-    batch_pocket = {key: [] for key in ['atom_feature', 'pos', 'knn_edge_index']}
+    batch_mol = {key: [] for key in ['node_type', 'pos', 'halfedge_type', 'halfedge_index', 'batch']}
+    batch_pocket = {key: [] for key in ['atom_feature', 'pos', 'knn_edge_index', 'batch']}
     
     for i, (mol, pocket) in enumerate(zip(molecules_list, pockets_list)):
         num_nodes = mol['pos'].shape[0]
@@ -40,12 +40,14 @@ def collate_fn(batch):
         
         if 'halfedge_index' in mol and mol['halfedge_index'].shape[1] > 0:
             batch_mol['halfedge_index'].append(mol['halfedge_index'] + cumsum_nodes)
+        batch_mol['batch'].append(torch.full((num_nodes,), i, dtype=torch.long))
         
         batch_pocket['atom_feature'].append(pocket['atom_feature'])
         batch_pocket['pos'].append(pocket['pos'])
         
         if 'knn_edge_index' in pocket and pocket['knn_edge_index'].shape[1] > 0:
             batch_pocket['knn_edge_index'].append(pocket['knn_edge_index'] + cumsum_pocket_nodes)
+        batch_pocket['batch'].append(torch.full((num_pocket_nodes,), i, dtype=torch.long))
         
         cumsum_nodes += num_nodes
         cumsum_pocket_nodes += num_pocket_nodes

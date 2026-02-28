@@ -28,11 +28,13 @@ from utils.featurizer import MoleculeFeaturizer, PocketFeaturizer
 from utils.pocket_featurizer import PharmolixFMPocketFeaturizer
 
 # 任务模型基类（简化版）
-class PocketMolDockModel:
-    pass
+class PocketMolDockModel(nn.Module):
+    def __init__(self):
+        super().__init__()
 
-class StructureBasedDrugDesignModel:
-    pass
+class StructureBasedDrugDesignModel(nn.Module):
+    def __init__(self):
+        super().__init__()
 
 # Featurized 泛型支持
 from typing import TypeVar, Generic
@@ -404,7 +406,7 @@ class ContextNodeBlock(nn.Module):
             self.gate = MLP(edge_dim+(node_dim+gate_dim)*2, hidden_dim, hidden_dim)
 
         self.centroid_lin = nn.Linear(node_dim, hidden_dim)
-        self.layer_norm = nn.LayerNorm(hidden_dim)
+        self.layer_norm = nn.LayerNorm(node_dim)
         # self.act = nn.ReLU()
         # self.out_transform = Linear(hidden_dim, node_dim)
         self.out_layer = MLP(hidden_dim, node_dim, hidden_dim)
@@ -432,7 +434,7 @@ class ContextNodeBlock(nn.Module):
         h_edge = self.edge_net(edge_attr)  # (E, H_per_head)
         msg_j = self.msg_net(h_edge + h_node[col] + h_node[row])
 
-        if self.gate_dim > 0:
+        if self.gate_dim > 0 and node_extra is not None:
             gate = self.gate(torch.cat([edge_attr, x[col], node_extra[col], x[row], node_extra[row]], dim=-1))
             msg_j = msg_j * torch.sigmoid(gate)
 
@@ -446,18 +448,19 @@ class ContextNodeBlock(nn.Module):
             h_ctx = self.ctx_node_net(ctx_x)
             h_ctx_edge = self.ctx_edge_net(ctx_edge_attr)
             msg_ctx = self.ctx_msg_net(h_ctx_edge * h_ctx[col])
-            if self.gate_dim > 0:
+            if self.gate_dim > 0 and node_extra is not None:
                 gate = self.ctx_gate(torch.cat([ctx_edge_attr, ctx_x[col], x[row], node_extra[row]], dim=-1))
                 msg_ctx = msg_ctx * torch.sigmoid(gate)
             aggred_ctx_msg = scatter_sum(msg_ctx, row, dim=0, dim_size=N)
             out = out + aggred_ctx_msg
 
         # output. skip connection
+        if self.layernorm_before:
+            out = self.layer_norm(out)
         out = self.out_layer(out)
+        out = out + x
         if not self.layernorm_before:
-            out = self.layer_norm(out + x)
-        else:
-            out = self.layer_norm(out) + x
+            out = self.layer_norm(out)
         return out
 
 class BondFFN(nn.Module):
@@ -586,15 +589,22 @@ class ContextNodeEdgeNet(nn.Module):
             
         # for context
         self.context_cfg = context_cfg
+        self.knn = kwargs.get('knn', 32)  # 从 kwargs 获取 knn，默认为 32
         if context_cfg is not None:
             context_edge_dim = context_cfg['edge_dim']
-            self.knn = context_cfg['knn']
+            self.knn = context_cfg.get('knn', self.knn)
             self.dist_exp_ctx = GaussianSmearing(**context_cfg['dist_cfg'])
             input_context_edge_dim = context_cfg['dist_cfg']['num_gaussians']
             assert context_dim > 0, 'context_dim should be larger than 0 if context_cfg is not None'
             assert not node_only, 'not support node_only with context'
         else:
             context_edge_dim = 0
+            input_context_edge_dim = 0
+            # 当 context_dim > 0 但没有 context_cfg 时，使用 dist_cfg 创建 dist_exp_ctx
+            if context_dim > 0:
+                self.dist_exp_ctx = GaussianSmearing(**dist_cfg)
+                # 使用 dist_cfg 的 num_gaussians 作为 input_context_edge_dim
+                input_context_edge_dim = dist_cfg['num_gaussians']
         
         # node network
         self.edge_embs = nn.ModuleList()
@@ -602,8 +612,10 @@ class ContextNodeEdgeNet(nn.Module):
         if not node_only:
             self.edge_blocks = nn.ModuleList()
             self.pos_blocks = nn.ModuleList()
-            if self.context_cfg is not None:
-                self.ctx_edge_embs = nn.ModuleList()
+        # 当 context_dim > 0 时，无论 node_only 如何，都需要 ctx_edge_embs
+        if context_dim > 0:
+            self.ctx_edge_embs = nn.ModuleList()
+            if not node_only:
                 self.ctx_pos_blocks = nn.ModuleList()
         for _ in range(num_blocks):
             # edge emb
@@ -613,6 +625,10 @@ class ContextNodeEdgeNet(nn.Module):
                 node_dim, edge_dim, hidden_dim, gate_dim,
                 context_dim, context_edge_dim, layernorm_before=self.layernorm_before
             ))
+            # context edge embedding - 需要在 node_only 检查之前
+            if context_dim > 0:
+                self.ctx_edge_embs.append(nn.Linear(input_context_edge_dim, context_edge_dim))
+            
             if node_only:
                 continue
             # edge update
@@ -623,8 +639,7 @@ class ContextNodeEdgeNet(nn.Module):
             self.pos_blocks.append(PosUpdate(
                 node_dim, edge_dim, hidden_dim=edge_dim, gate_dim=gate_dim*2,
             ))
-            if self.context_cfg is not None:
-                self.ctx_edge_embs.append(nn.Linear(input_context_edge_dim, context_edge_dim))
+            if context_dim > 0:
                 self.ctx_pos_blocks.append(PosUpdate(
                     node_dim, context_edge_dim, hidden_dim=edge_dim, gate_dim=gate_dim,
                     node_dim_right=context_dim,
@@ -733,7 +748,7 @@ class ContextNodeEdgeNet(nn.Module):
 
 class PharmolixFM(PocketMolDockModel, StructureBasedDrugDesignModel):
     def __init__(self, model_cfg: Config) -> None:
-        super(PharmolixFM, self).__init__(model_cfg)
+        nn.Module.__init__(self)  # 调用 nn.Module 的 __init__
         self.config = model_cfg
         self.num_node_types = model_cfg.num_node_types
         self.num_edge_types = model_cfg.num_edge_types
@@ -741,7 +756,10 @@ class PharmolixFM(PocketMolDockModel, StructureBasedDrugDesignModel):
         # # pocket encoder
         pocket_dim = model_cfg.pocket_dim
         self.pocket_embedder = nn.Linear(model_cfg.pocket_in_dim, pocket_dim)
-        self.pocket_encoder = ContextNodeEdgeNet(pocket_dim, node_only=True, **model_cfg.pocket.todict())
+        pocket_cfg = {k: v for k, v in model_cfg.pocket.items() if k != 'node_dim'}
+        pocket_cfg['node_dim'] = pocket_dim
+        pocket_cfg['node_only'] = True
+        self.pocket_encoder = ContextNodeEdgeNet(**pocket_cfg)
 
         # # mol embedding
         self.addition_node_features = getattr(model_cfg, 'addition_node_features', [])
@@ -753,8 +771,10 @@ class PharmolixFM(PocketMolDockModel, StructureBasedDrugDesignModel):
         self.edgetype_embedder = nn.Linear(self.num_edge_types + 2, edge_emb_dim) # t_halfedge_in and fixed_halfdist
 
         # # bfn backbone
-        self.denoiser = ContextNodeEdgeNet(node_dim, edge_dim,
-                            context_dim=pocket_dim, **model_cfg.denoiser.todict())
+        denoiser_cfg = {k: v for k, v in model_cfg.denoiser.items() if k not in ['node_dim', 'edge_dim']}
+        denoiser_cfg['node_dim'] = node_dim
+        denoiser_cfg['edge_dim'] = edge_dim
+        self.denoiser = ContextNodeEdgeNet(context_dim=pocket_dim, **denoiser_cfg)
 
         # # decoder for discrete variables
         self.node_decoder = MLP(node_dim, self.num_node_types, node_dim)
@@ -772,8 +792,8 @@ class PharmolixFM(PocketMolDockModel, StructureBasedDrugDesignModel):
             "pocket": PharmolixFMPocketFeaturizer(model_cfg.pocket_knn, model_cfg.pos_norm),
         }
         self.collators = {
-            "molecule": PygCollator(follow_batch=["pos", "node_type", "halfedge_type"]),
-            "pocket": PygCollator(follow_batch=["pos"])
+            "molecule": PygCollator(),
+            "pocket": PygCollator()
         }
 
         for parent in reversed(type(self).__mro__[1:-1]):
@@ -883,11 +903,11 @@ class PharmolixFM(PocketMolDockModel, StructureBasedDrugDesignModel):
             edge_index=edge_index,
             node_extra=node_extra,
             edge_extra=edge_extra,
-            batch_node=molecule['node_type_batch'],
+            batch_node=molecule['batch'],
             # pocket
             h_ctx=h_pocket,
             pos_ctx=pocket['pos'],
-            batch_ctx=pocket['pos_batch'],
+            batch_ctx=pocket['batch'],
         )
 
         # # 3 predict the variables
@@ -978,7 +998,7 @@ class PharmolixFM(PocketMolDockModel, StructureBasedDrugDesignModel):
             cfd_traj[key] = torch.stack(cfd_traj[key], dim=0)
 
         # Split and reconstruct molecule
-        num_mols = molecule["node_type_batch"].max() + 1
+        num_mols = molecule["batch"].max() + 1
         in_traj_split, out_traj_split, cfd_traj_split = [], [], []
         out_molecules = []
         for i in tqdm(range(num_mols), desc="Post processing molecules..."):
@@ -1126,6 +1146,7 @@ class PharmolixFM(PocketMolDockModel, StructureBasedDrugDesignModel):
             't_node_type': t_per_node,
             't_halfedge_type': t_per_edge,
             'fixed_halfdist': torch.zeros(noisy_edge.shape[0], device=device),
+            'batch': mol_batch,
         }
         
         # Batch 前向传播
@@ -1138,7 +1159,7 @@ class PharmolixFM(PocketMolDockModel, StructureBasedDrugDesignModel):
         y_sender_pos, rho_sender_pos = bfn_loss.compute_sender_continuous(
             molecules_batch['pos'], t_per_node, bfn_loss.sigma_data_pos)
         pos_diff = outputs['pos'] - y_sender_pos
-        pos_loss_per_node = rho_sender_pos.view(-1, 1) * (pos_diff ** 2).sum(dim=-1)  # (N,)
+        pos_loss_per_node = rho_sender_pos.view(-1) * (pos_diff ** 2).sum(dim=-1)  # (N,)
         
         # 2. 节点类型损失（离散变量）- 每个节点
         theta_sender_node = bfn_loss.compute_sender_discrete(

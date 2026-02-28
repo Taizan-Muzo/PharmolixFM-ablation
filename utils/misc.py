@@ -18,5 +18,8 @@ def safe_index(lst: List[Any], item: Any) -> int:
 class PygCollator:
     """PyG 数据批次整理器"""
     
+    def __init__(self, follow_batch=None):
+        self.follow_batch = follow_batch or []
+    
     def __call__(self, batch):
-        return Batch.from_data_list(batch)
+        return Batch.from_data_list(batch, follow_batch=self.follow_batch)
