@@ -63,12 +63,22 @@ def docking_inference(model, pdb_path: str, sdf_path: str, device: str = "cpu"):
     mol_features = featurizers["molecule"](ligand)
     pocket_features = featurizers["pocket"](pocket)
     
+    # 添加 batch 属性（单样本推理，所有节点属于批次 0）
+    import torch
+    mol_features.batch = torch.zeros(mol_features.pos.shape[0], dtype=torch.long, device=device)
+    pocket_features.batch = torch.zeros(pocket_features.pos.shape[0], dtype=torch.long, device=device)
+    
+    # 添加 {key}_batch 属性用于后处理
+    mol_features.pos_batch = mol_features.batch
+    mol_features.node_type_batch = mol_features.batch
+    mol_features.halfedge_type_batch = torch.zeros(mol_features.halfedge_type.shape[0], dtype=torch.long, device=device)
+    
     # 移到设备
-    for key in mol_features:
-        if isinstance(mol_features[key], torch.Tensor):
+    for key in mol_features.keys():
+        if isinstance(mol_features[key], torch.Tensor) and mol_features[key].device != device:
             mol_features[key] = mol_features[key].to(device)
-    for key in pocket_features:
-        if isinstance(pocket_features[key], torch.Tensor):
+    for key in pocket_features.keys():
+        if isinstance(pocket_features[key], torch.Tensor) and pocket_features[key].device != device:
             pocket_features[key] = pocket_features[key].to(device)
     
     # 推理
@@ -95,21 +105,78 @@ def design_inference(model, pdb_path: str, num_samples: int = 10, device: str = 
     print(f"Loading protein from {pdb_path}...")
     protein = Protein.from_pdb_file(pdb_path)
     
-    # 创建虚拟口袋（需要参考配体定义口袋位置）
-    # 这里简化处理，使用蛋白质中心作为口袋中心
+    # 创建口袋（使用整个蛋白质作为口袋，以蛋白质中心为口袋中心）
     print("Creating pocket...")
+    from Bio.PDB import PDBParser
+    import numpy as np
+    
     pocket = Pocket()
+    pocket.protein = protein
+    
+    # 解析 PDB 文件提取所有原子
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure('protein', pdb_path)
+    
+    # 氨基酸映射
+    aa_to_idx = {
+        'ALA': 0, 'CYS': 1, 'ASP': 2, 'GLU': 3, 'PHE': 4,
+        'GLY': 5, 'HIS': 6, 'ILE': 7, 'LYS': 8, 'LEU': 9,
+        'MET': 10, 'ASN': 11, 'PRO': 12, 'GLN': 13, 'ARG': 14,
+        'SER': 15, 'THR': 16, 'VAL': 17, 'TRP': 18, 'TYR': 19,
+    }
+    
+    # 原子序数映射
+    element_to_z = {
+        'C': 6, 'N': 7, 'O': 8, 'S': 16, 'H': 1,
+        'P': 15, 'F': 9, 'Cl': 17, 'CL': 17, 'Br': 35, 'BR': 35, 'I': 53,
+    }
+    
+    # 骨架原子
+    backbone_atoms = {'N', 'CA', 'C', 'O'}
+    
     pocket.atoms = []
-    pocket.center = [0.0, 0.0, 0.0]  # 需要根据实际情况设置
+    coordinates = []
+    
+    for struct_model in structure:
+        for chain in struct_model:
+            for residue in chain:
+                res_name = residue.resname
+                aa_type = aa_to_idx.get(res_name, 0)
+                
+                for atom in residue:
+                    coord = atom.coord
+                    atom_name = atom.name
+                    element = atom.element if atom.element else atom_name[0]
+                    atomic_number = element_to_z.get(element, 6)
+                    is_backbone = 1 if atom_name in backbone_atoms else 0
+                    
+                    pocket.atoms.append({
+                        'atomic_number': atomic_number,
+                        'aa_type': aa_type,
+                        'is_backbone': is_backbone,
+                        'name': atom_name,
+                        'residue': res_name,
+                    })
+                    coordinates.append(coord)
+    
+    if coordinates:
+        pocket.conformer = np.array(coordinates)
+        pocket.center = np.mean(coordinates, axis=0)
+    else:
+        pocket.center = np.array([0.0, 0.0, 0.0])
     
     # 特征化
     print("Featurizing...")
     featurizers = model.featurizers
     pocket_features = featurizers["pocket"](pocket)
     
+    # 添加 batch 属性
+    import torch
+    pocket_features.batch = torch.zeros(pocket_features.pos.shape[0], dtype=torch.long, device=device)
+    
     # 移到设备
-    for key in pocket_features:
-        if isinstance(pocket_features[key], torch.Tensor):
+    for key in pocket_features.keys():
+        if isinstance(pocket_features[key], torch.Tensor) and pocket_features[key].device != device:
             pocket_features[key] = pocket_features[key].to(device)
     
     # 生成多个分子

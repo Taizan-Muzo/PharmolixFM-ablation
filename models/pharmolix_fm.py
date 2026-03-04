@@ -835,14 +835,16 @@ class PharmolixFM(PocketMolDockModel, StructureBasedDrugDesignModel):
             halfedge_index.append(torch.triu_indices(num, num, offset=1) + cur_num)
             cur_num += num
 
+        batch_tensor = torch.repeat_interleave(torch.arange(batch_size), num_atoms)
         return Data(**{
             "pos": torch.randn(num_atoms.sum().item(), 3) * 0.01,
             "node_type": torch.ones(num_atoms.sum().item(), self.num_node_types) / self.num_node_types,
             "halfedge_type": torch.ones(num_halfedge.sum().item(), self.num_edge_types) / self.num_edge_types,
             "is_peptide": torch.zeros(num_atoms.sum().item(), dtype=torch.long),
             "halfedge_index": torch.cat(halfedge_index, dim=1),
-            "pos_batch": torch.repeat_interleave(torch.arange(batch_size), num_atoms),
-            "node_type_batch": torch.repeat_interleave(torch.arange(batch_size), num_atoms),
+            "batch": batch_tensor,
+            "pos_batch": batch_tensor,
+            "node_type_batch": batch_tensor,
             "halfedge_type_batch": torch.repeat_interleave(torch.arange(batch_size), num_halfedge),
         }).to(pocket["atom_feature"].device)
 
@@ -865,8 +867,25 @@ class PharmolixFM(PocketMolDockModel, StructureBasedDrugDesignModel):
         # add t indicator as extra features
         node_extra = torch.stack([molecule['t_node_type'], molecule['t_pos']], dim=1).to(pos_in.dtype)
         halfedge_extra = torch.stack([molecule['t_halfedge_type'], molecule['fixed_halfdist']], dim=1).to(pos_in.dtype)
+        
+        # -------------------- Node 部分修正 (删除重复代码，增加稳健性) --------------------
+        # 仅当 h_node_in 是 3D (Dense Batch) 且 node_extra 是 2D 时才扩展
+        # 如果 h_node_in 是 2D (Sparse Batch), 则保持 node_extra 为 2D 直接拼接
+        if h_node_in.dim() == 3 and node_extra.dim() == 2:
+            node_extra = node_extra.unsqueeze(1).expand(-1, h_node_in.size(1), -1)
+
+        # 【重要】只保留这一行拼接！删除下面多余的重复行
         h_node_in = torch.cat([h_node_in, node_extra], dim=-1)
+        # -------------------- Node 修正结束 --------------------
+
+        # -------------------- Edge 部分修正 (删除重复代码，增加稳健性) --------------------
+        # 同理，自动适配维度
+        if h_halfedge_in.dim() == 3 and halfedge_extra.dim() == 2:
+            halfedge_extra = halfedge_extra.unsqueeze(1).expand(-1, h_halfedge_in.size(1), -1)
+
+        # 【重要】只保留这一行拼接！
         h_halfedge_in = torch.cat([h_halfedge_in, halfedge_extra], dim=-1)
+        # -------------------- Edge 修正结束 --------------------
 
         # from 1/K \in [0,1] to 2/K-1 \in [-1,1]
         h_node_in = self.nodetype_embedder(2 * h_node_in - 1)
@@ -970,7 +989,8 @@ class PharmolixFM(PocketMolDockModel, StructureBasedDrugDesignModel):
             for key in t_in:
                 in_traj[key].append(copy.deepcopy(molecule[key]))
                 out_traj[key].append(copy.deepcopy(outputs_step[key]))
-                cfd_traj[key].append(copy.deepcopy(outputs_step[f"confidence_{key}"]))
+                if f"confidence_{key}" in outputs_step:
+                    cfd_traj[key].append(copy.deepcopy(outputs_step[f"confidence_{key}"]))
 
             # Destination prediction
             if step == self.config.num_sample_steps:
@@ -995,7 +1015,8 @@ class PharmolixFM(PocketMolDockModel, StructureBasedDrugDesignModel):
         for key in molecule_in:
             in_traj[key] = torch.stack(in_traj[key], dim=0)
             out_traj[key] = torch.stack(out_traj[key], dim=0)
-            cfd_traj[key] = torch.stack(cfd_traj[key], dim=0)
+            if len(cfd_traj[key]) > 0:
+                cfd_traj[key] = torch.stack(cfd_traj[key], dim=0)
 
         # Split and reconstruct molecule
         num_mols = molecule["batch"].max() + 1
@@ -1010,7 +1031,8 @@ class PharmolixFM(PocketMolDockModel, StructureBasedDrugDesignModel):
                 idx = torch.where(molecule[f"{key}_batch"] == i)[0]
                 in_traj_split[i][key] = in_traj[key][:, idx, :]
                 out_traj_split[i][key] = out_traj[key][:, idx, :]
-                cfd_traj_split[i][key] = cfd_traj[key][:, idx, :]
+                if len(cfd_traj[key]) > 0:
+                    cfd_traj_split[i][key] = cfd_traj[key][:, idx, :]
                 cur_molecule[key] = out_traj_split[i][key][-1]
             cur_molecule["node_type"] = torch.argmax(cur_molecule["node_type"], dim=-1)
             cur_molecule["halfedge_type"] = torch.argmax(cur_molecule["halfedge_type"], dim=-1)
@@ -1043,32 +1065,41 @@ class PharmolixFM(PocketMolDockModel, StructureBasedDrugDesignModel):
         bfn_loss = BFNLoss(self.config)
         
         # 采样时间步
-        t = torch.rand(label['pos'].shape[0], device=device)
+        num_nodes = label['pos'].shape[0]
+        num_edges = label['halfedge_type'].shape[0] if 'halfedge_type' in label else 0
+        t_node = torch.rand(num_nodes, device=device)
+        t_edge = t_node[label['halfedge_index'][0]] if num_edges > 0 and 'halfedge_index' in label else torch.zeros(0, device=device)
         
         # 添加噪声到标签
-        noisy_pos = add_noise_to_continuous(label['pos'], t, self.config.sigma_data_pos)
+        noisy_pos = add_noise_to_continuous(label['pos'], t_node, sigma_data=self.config.sigma_data_pos)
         noisy_node = add_noise_to_discrete(
             label['node_type'].argmax(dim=-1), 
-            t, 
+            t_node, 
             self.config.num_node_types
         )
         noisy_edge = add_noise_to_discrete(
             label['halfedge_type'].argmax(dim=-1) if label['halfedge_type'].dim() > 1 else label['halfedge_type'],
-            t,
+            t_edge,
             self.config.num_edge_types
         )
         
         # 构建输入
+        batch_node = torch.zeros(num_nodes, dtype=torch.long, device=device)
         molecule_in = {
             'pos': noisy_pos,
             'node_type': noisy_node,
             'halfedge_type': noisy_edge,
             'halfedge_index': label.get('halfedge_index', torch.zeros(2, 0, dtype=torch.long, device=device)),
-            't_pos': t,
-            't_node_type': t,
-            't_halfedge_type': t,
+            't_pos': t_node,
+            't_node_type': t_node,
+            't_halfedge_type': t_edge,
             'fixed_halfdist': torch.zeros(noisy_edge.shape[0], device=device),
+            'batch': batch_node,
         }
+        
+        # 确保 pocket 也有 batch
+        if 'batch' not in pocket:
+            pocket['batch'] = torch.zeros(pocket['pos'].shape[0], dtype=torch.long, device=device)
         
         # 模型前向
         outputs = self.model_forward(molecule_in, pocket)
@@ -1080,9 +1111,30 @@ class PharmolixFM(PocketMolDockModel, StructureBasedDrugDesignModel):
             'halfedge_type': label['halfedge_type'].argmax(dim=-1) if label['halfedge_type'].dim() > 1 else label['halfedge_type'],
         }
         
-        loss_dict = bfn_loss.compute_loss(outputs, targets, t)
+        # 计算各项损失（使用对应的时间步）
+        pos_loss = bfn_loss.continuous_var_loss(
+            outputs['pos'], targets['pos'], t_node, bfn_loss.sigma_data_pos)
+        node_loss = bfn_loss.discrete_var_loss(
+            outputs['node_type'], targets['node_type'], t_node, self.config.num_node_types)
         
-        return loss_dict
+        # 边损失使用边时间步
+        num_edges = targets['halfedge_type'].shape[0]
+        if num_edges > 0:
+            t_edge = t_node[label['halfedge_index'][0]]
+            edge_loss = bfn_loss.discrete_var_loss(
+                outputs['halfedge_type'], targets['halfedge_type'], t_edge, self.config.num_edge_types)
+        else:
+            edge_loss = torch.tensor(0.0, device=device)
+        
+        total_loss = pos_loss + node_loss + edge_loss
+        
+        return {
+            'loss': total_loss,
+            'pos_loss': pos_loss,
+            'node_loss': node_loss,
+            'edge_loss': edge_loss,
+        }
+
 
     def forward_pocket_molecule_docking_batch(self, pockets_batch, molecules_batch):
         """
@@ -1097,7 +1149,6 @@ class PharmolixFM(PocketMolDockModel, StructureBasedDrugDesignModel):
             平均损失字典
         """
         from models.bfn_loss import BFNLoss, add_noise_to_continuous, add_noise_to_discrete
-        from torch_geometric.data import Batch
         
         device = molecules_batch['pos'].device
         bfn_loss = BFNLoss(self.config)
@@ -1105,7 +1156,6 @@ class PharmolixFM(PocketMolDockModel, StructureBasedDrugDesignModel):
         # 获取 batch 信息
         batch_size = molecules_batch['batch'].max().item() + 1
         mol_batch = molecules_batch['batch']
-        pocket_batch = pockets_batch['batch']
         
         # 为每个样本采样时间步
         t_per_sample = torch.rand(batch_size, device=device)
@@ -1130,8 +1180,7 @@ class PharmolixFM(PocketMolDockModel, StructureBasedDrugDesignModel):
         else:
             edge_classes = molecules_batch['halfedge_type']
         
-        # 为边创建时间步（需要重新索引）
-        # 简化：使用节点时间步的平均或第一个节点的时间步
+        # 为边创建时间步
         t_per_edge = t_per_node[molecules_batch['halfedge_index'][0]] if molecules_batch['halfedge_index'].shape[1] > 0 else t_per_node[:0]
         noisy_edge = add_noise_to_discrete(
             edge_classes, t_per_edge, self.config.num_edge_types)
@@ -1184,7 +1233,6 @@ class PharmolixFM(PocketMolDockModel, StructureBasedDrugDesignModel):
             )).sum(dim=-1)  # (E,)
             
             # 使用 scatter_mean 计算每个样本的边损失
-            # 需要知道每条边属于哪个样本
             edge_batch = mol_batch[molecules_batch['halfedge_index'][0]]  # (E,)
             edge_loss_per_sample = scatter_mean(edge_loss_per_edge, edge_batch, dim=0, dim_size=batch_size)
         else:
@@ -1215,6 +1263,7 @@ class PharmolixFM(PocketMolDockModel, StructureBasedDrugDesignModel):
             'node_loss': total_node_loss,
             'edge_loss': total_edge_loss,
         }
+
 
     def forward_structure_based_drug_design(self, pocket: List[Pocket], label: List[Molecule]) -> Dict[str, torch.Tensor]:
         """

@@ -36,6 +36,7 @@ class Config:
         self.pocket_dim = 128
         self.pocket_in_dim = 25  # 4 (elements) + 20 (aa_types) + 1 (is_backbone)
         self.pocket_knn = 32
+        self.pos_norm = 1.0  # 位置归一化因子
         
         # 额外特征
         self.addition_node_features = []
@@ -66,6 +67,11 @@ class Config:
             'dist_cfg': self.dist_cfg,
             'gate_dim': 2,
             'knn': 32,
+            'context_cfg': {
+                'edge_dim': 32,
+                'dist_cfg': self.dist_cfg,
+                'knn': 32,
+            },
         }
         
         # 训练配置

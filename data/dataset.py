@@ -12,6 +12,9 @@ from data.molecule import Molecule, Protein, Pocket
 from utils.featurizer import PharmolixFMMoleculeFeaturizer
 from utils.pocket_featurizer import PharmolixFMPocketFeaturizer
 
+# 导入新的数据集
+from data.crossdocked_dataset import CrossDockedDataset, PDBBindDataset
+
 
 class PocketMoleculeDataset(Dataset):
     """
@@ -50,26 +53,32 @@ class PocketMoleculeDataset(Dataset):
         self.data_list = self._load_data_list()
     
     def _load_data_list(self) -> List[Dict[str, str]]:
-        """加载数据索引"""
+        """加载数据索引 - 支持 CrossDocked 格式"""
         data_list = []
         
         # 查找所有复合物
-        split_dir = self.data_dir / self.split
-        if not split_dir.exists():
-            print(f"Warning: {split_dir} does not exist")
+        data_path = self.data_dir
+        if not data_path.exists():
+            print(f"Warning: {data_path} does not exist")
             return data_list
         
-        # 假设每个子目录是一个复合物
-        for complex_dir in split_dir.iterdir():
+        # 支持 CrossDocked 格式：每个子目录包含多个 PDB/SDF 文件
+        for complex_dir in data_path.iterdir():
             if complex_dir.is_dir():
-                pdb_file = complex_dir / "protein.pdb"
-                sdf_file = complex_dir / "ligand.sdf"
+                # 查找所有 SDF 文件（配体）
+                sdf_files = list(complex_dir.glob("*.sdf"))
+                # 查找所有 PDB 文件（蛋白质）
+                pdb_files = list(complex_dir.glob("*.pdb"))
                 
-                if pdb_file.exists() and sdf_file.exists():
+                # 过滤掉配体 PDB 文件（文件名包含 _lig）
+                protein_files = [f for f in pdb_files if "_lig" not in f.name]
+                
+                if sdf_files and protein_files:
+                    # 使用第一个匹配的文件对
                     data_list.append({
                         "name": complex_dir.name,
-                        "pdb": str(pdb_file),
-                        "sdf": str(sdf_file),
+                        "pdb": str(protein_files[0]),
+                        "sdf": str(sdf_files[0]),
                     })
         
         print(f"Loaded {len(data_list)} complexes for {self.split}")
@@ -92,25 +101,31 @@ class PocketMoleculeDataset(Dataset):
             molecule = Molecule.from_sdf_file(item["sdf"])
             mol_features = self.mol_featurizer(molecule)
             
-            # 加载蛋白质并定义口袋
+            # 加载蛋白质并定义口袋（使用配体位置定义口袋区域）
             protein = Protein.from_pdb_file(item["pdb"])
-            pocket = Pocket.from_protein_ref_ligand(protein, molecule)
+            pocket = Pocket.from_protein_ref_ligand(protein, molecule, pocket_size=10.0)
             
-            # TODO: 从 PDB 解析口袋原子信息
-            # 暂时使用空的原子列表
-            pocket.atoms = []
+            # 确保口袋有原子数据
+            if not pocket.atoms or len(pocket.atoms) == 0:
+                # 如果口袋为空，尝试使用整个蛋白质
+                print(f"Warning: Empty pocket for {item['name']}, using protein center")
+                # 重新创建口袋，使用更大的半径
+                pocket = Pocket.from_protein_ref_ligand(protein, molecule, pocket_size=20.0)
             
             pocket_features = self.pocket_featurizer(pocket)
             
             metadata = {
                 "name": item["name"],
                 "num_atoms": molecule.get_num_atoms(),
+                "pocket_atoms": len(pocket.atoms) if pocket.atoms else 0,
             }
             
             return mol_features, pocket_features, metadata
             
         except Exception as e:
             print(f"Error loading {item['name']}: {e}")
+            import traceback
+            traceback.print_exc()
             # 返回空样本
             return self._get_empty_sample()
     

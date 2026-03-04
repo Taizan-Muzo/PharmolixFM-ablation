@@ -4,3 +4,7 @@ checkpoints/
 __pycache__/
 *py[cod]
 *$py.class
+data/crossdocked
+data/posebusters/
+data/test/
+data/posebusters_benchmark_set.zip

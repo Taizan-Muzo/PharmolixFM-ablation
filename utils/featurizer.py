@@ -77,10 +77,10 @@ class PharmolixFMMoleculeFeaturizer(MoleculeFeaturizer):
             halfedge_index = torch.triu_indices(num_nodes, num_nodes, offset=1)
             halfedge_type = F.one_hot(halfedge_matrix[halfedge_index[0], halfedge_index[1]], num_classes=self.num_edge_types).float()
         
-        return {
+        return Data(**{
             'node_type': node_type,
             'pos': pos,
             'halfedge_index': halfedge_index,
             'halfedge_type': halfedge_type,
             'num_nodes': num_nodes,
-        }
+        })
